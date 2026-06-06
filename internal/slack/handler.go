@@ -2,6 +2,7 @@ package slack
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 
@@ -10,25 +11,28 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-// AskFunc is the function the handler calls to get an answer from Claude.
-type AskFunc func(ctx context.Context, question string) (string, error)
+// AskFunc is the function the handler calls to get an answer.
+// source is the name of the wiki source to query; empty means all sources.
+type AskFunc func(ctx context.Context, source, question string) (string, error)
 
 type Handler struct {
-	client *slack.Client
-	socket *socketmode.Client
-	askFn  AskFunc
+	client       *slack.Client
+	socket       *socketmode.Client
+	askFn        AskFunc
+	sourceNames  []string
 }
 
-func NewHandler(botToken, appToken string, askFn AskFunc) *Handler {
+func NewHandler(botToken, appToken string, askFn AskFunc, sourceNames []string) *Handler {
 	client := slack.New(
 		botToken,
 		slack.OptionAppLevelToken(appToken),
 	)
 	socket := socketmode.New(client)
 	return &Handler{
-		client: client,
-		socket: socket,
-		askFn:  askFn,
+		client:      client,
+		socket:      socket,
+		askFn:       askFn,
+		sourceNames: sourceNames,
 	}
 }
 
@@ -66,8 +70,9 @@ func (h *Handler) handleAPIEvent(event slackevents.EventsAPIEvent) {
 		if !ok {
 			return
 		}
-		question := stripMention(ev.Text)
-		h.reply(ev.Channel, ev.TimeStamp, ev.User, question)
+		text := stripMention(ev.Text)
+		source, question := h.parseSource(text)
+		h.reply(ev.Channel, ev.TimeStamp, ev.User, source, question)
 
 	case "message":
 		ev, ok := event.InnerEvent.Data.(*slackevents.MessageEvent)
@@ -75,12 +80,13 @@ func (h *Handler) handleAPIEvent(event slackevents.EventsAPIEvent) {
 			return
 		}
 		if ev.ChannelType == "im" && ev.BotID == "" {
-			h.reply(ev.Channel, ev.TimeStamp, ev.User, ev.Text)
+			source, question := h.parseSource(ev.Text)
+			h.reply(ev.Channel, ev.TimeStamp, ev.User, source, question)
 		}
 	}
 }
 
-func (h *Handler) reply(channel, threadTS, user, question string) {
+func (h *Handler) reply(channel, threadTS, user, source, question string) {
 	if strings.TrimSpace(question) == "" {
 		return
 	}
@@ -88,10 +94,13 @@ func (h *Handler) reply(channel, threadTS, user, question string) {
 	log.Printf("┌─ New Request ────────────────────────────────")
 	log.Printf("│ User    : %s", user)
 	log.Printf("│ Channel : %s", channel)
+	if source != "" {
+		log.Printf("│ Source  : %s", source)
+	}
 	log.Printf("│ Question: %s", question)
 	log.Printf("│ Thinking...")
 
-	answer, err := h.askFn(context.Background(), question)
+	answer, err := h.askFn(context.Background(), source, question)
 	if err != nil {
 		log.Printf("│ ERROR: %v", err)
 		log.Printf("└──────────────────────────────────────────────")
@@ -111,8 +120,36 @@ func (h *Handler) reply(channel, threadTS, user, question string) {
 	}
 }
 
+// parseSource checks if the message starts with [source: <name>] and extracts it.
+// Returns the source name (or "" if not specified) and the cleaned question.
+func (h *Handler) parseSource(text string) (source, question string) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "[source:") {
+		return "", text
+	}
+
+	end := strings.Index(text, "]")
+	if end == -1 {
+		return "", text
+	}
+
+	raw := strings.TrimPrefix(text[:end+1], "[source:")
+	raw = strings.TrimSuffix(raw, "]")
+	name := strings.TrimSpace(raw)
+
+	// validate against known sources
+	for _, s := range h.sourceNames {
+		if strings.EqualFold(s, name) {
+			return s, strings.TrimSpace(text[end+1:])
+		}
+	}
+
+	// unknown source — tell the user
+	known := strings.Join(h.sourceNames, ", ")
+	return "", fmt.Sprintf("[source %q not found; available: %s] %s", name, known, strings.TrimSpace(text[end+1:]))
+}
+
 func stripMention(text string) string {
-	// Slack mentions look like <@U12345678>
 	if idx := strings.Index(text, ">"); idx != -1 {
 		return strings.TrimSpace(text[idx+1:])
 	}
